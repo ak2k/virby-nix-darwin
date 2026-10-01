@@ -63,6 +63,7 @@ let
   sshHostKeyAlias = "${vmHostName}-key";
 
   daemonName = "virbyd";
+  daemonLabel = config.launchd.daemons.${daemonName}.serviceConfig.Label;
 
   darwinGid = 348;
   darwinGroup = "virby";
@@ -95,6 +96,7 @@ let
     cd ${workingDirectory}
 
     NEEDS_GENERATE_SSH_KEYS=0
+    SSH_KEYS_REGENERATED=0
 
     should_generate_ssh_keys() {
       local key_files=(
@@ -179,6 +181,7 @@ let
         ${logError} "Failed to generate SSH keys"
         exit 1
       fi
+      SSH_KEYS_REGENERATED=1
     fi
 
     # The runner always uses the private key directly, so it must stay owner-only.
@@ -216,6 +219,13 @@ let
     if ! chmod 'go+r' ${sshKnownHostsFileName}; then
       ${logError} "Failed to set permissions on ${sshKnownHostsFileName}"
       exit 1
+    fi
+
+    # A VM that is already running keeps serving the previous host key, which no longer matches
+    # ssh_known_hosts. Restart the daemon so the next build connection boots a VM with the new keys.
+    if [[ $SSH_KEYS_REGENERATED -eq 1 ]] && /bin/launchctl print system/${daemonLabel} &>/dev/null; then
+      ${logInfo} "Restarting ${daemonName} to apply the regenerated SSH host key..."
+      /bin/launchctl kickstart -k system/${daemonLabel} || true
     fi
   '';
 
