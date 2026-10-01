@@ -227,6 +227,10 @@ let
       supportedFeatures = [
         "benchmark"
         "big-parallel"
+      ]
+      # Without nested virtualization the guest has no /dev/kvm, so builds requiring these features
+      # would fail here instead of being routed to a builder that can run them.
+      ++ lib.optionals cfg.nestedVirtualization [
         "kvm"
         "nixos-test"
       ];

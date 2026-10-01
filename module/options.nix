@@ -120,6 +120,9 @@ in
         Nested virtualization requires an M3 or later CPU and macOS 15+. Since Nix lacks the ability to
         check the CPU version, the vm-runner will check at runtime. If the CPU is not compatible, vm-runner
         will print a warning in the log file and ignore the option.
+
+        The VM is only advertised as supporting the `kvm` and `nixos-test` system features when this
+        option is enabled.
       '';
     };
 
