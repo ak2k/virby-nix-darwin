@@ -113,9 +113,9 @@ func (c *APIClient) callAPI(endpoint string, method string, data Data) (Data, er
 	return nil, fmt.Errorf("request failed after %d attempts", maxRetries+1)
 }
 
+// Close only drops idle connections: the VMProcess keeps this client for every VM it starts.
 func (c *APIClient) Close() {
 	c.client.CloseIdleConnections()
-	c.client = nil
 }
 
 func (c *APIClient) Get(endpoint string) (Data, error) {
