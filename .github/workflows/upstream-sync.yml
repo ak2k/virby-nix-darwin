@@ -3,6 +3,11 @@ name: Sync upstream
 # Merges upstream main into this fork's main once a day, and pushes only when
 # the merged tree passes the checks below. Merging rather than rebasing keeps
 # every commit a consumer has pinned reachable from main.
+#
+# The check job runs upstream's code with a read-only token; the publish job
+# holds write access and runs none of it. GITHUB_TOKEN cannot push a merge that
+# changes .github/workflows/, so such an upstream change ends in the failure
+# issue and needs a manual sync.
 
 on:
   schedule:
@@ -21,21 +26,22 @@ env:
   RETIRE_TITLE: "Sync upstream: the fork carries nothing beyond upstream; retire it"
 
 jobs:
-  sync:
+  check:
     # GitHub-hosted arm64, because this repository is public.
     runs-on: macos-15
     permissions:
-      contents: write
-      issues: write
+      contents: read
+    outputs:
+      result: ${{ steps.merge.outputs.result }}
+      tree: ${{ steps.merge.outputs.tree }}
+      upstream-sha: ${{ steps.merge.outputs.upstream-sha }}
     steps:
       - name: Check out main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
-          # GITHUB_TOKEN cannot push a merge that changes upstream's workflow files; a token
-          # with the workflows permission in SYNC_TOKEN can.
-          token: ${{ secrets.SYNC_TOKEN || github.token }}
+          persist-credentials: false
 
       - name: Merge upstream main
         id: merge
@@ -54,6 +60,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git merge --no-ff --no-edit -m "Merge upstream main at ${upstream_sha:0:7}" "$upstream_sha"; then
             echo "result=merged" >> "$GITHUB_OUTPUT"
+            echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
           else
             git merge --abort
             echo "result=conflict" >> "$GITHUB_OUTPUT"
@@ -106,78 +113,165 @@ jobs:
           EOF
           )"
 
+      # The build also runs the Go tests.
       - name: Build vm-runner
         if: steps.merge.outputs.result == 'merged'
         run: nix build -L --no-link .#packages.aarch64-darwin.vm-runner
 
-      - name: Vet and test vm-runner
+      - name: Vet vm-runner
         if: steps.merge.outputs.result == 'merged'
         working-directory: pkgs/vm-runner
         env:
           GOTOOLCHAIN: local
+        run: nix shell --inputs-from "$GITHUB_WORKSPACE" nixpkgs#go -c go vet ./...
+
+  publish:
+    needs: check
+    if: needs.check.outputs.result == 'merged'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          # Kept: the push below authenticates with it. Nothing from the merge is executed here.
+          persist-credentials: true
+
+      - name: Re-create the checked merge
+        env:
+          TREE: ${{ needs.check.outputs.tree }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream-sha }}
         run: |
-          nix shell --inputs-from "$GITHUB_WORKSPACE" nixpkgs#go -c go vet ./...
-          nix shell --inputs-from "$GITHUB_WORKSPACE" nixpkgs#go -c go test ./...
+          git fetch --no-tags "$UPSTREAM_URL" main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff --no-edit -m "Merge upstream main at ${UPSTREAM_SHA:0:7}" "$UPSTREAM_SHA"
+          tree=$(git rev-parse 'HEAD^{tree}')
+          if [[ $tree != "$TREE" ]]; then
+            echo "::error::merged tree $tree differs from the checked tree $TREE"
+            exit 1
+          fi
 
       - name: Push main
-        if: steps.merge.outputs.result == 'merged'
         run: git push origin HEAD:refs/heads/main
+
+      - name: Delete stale sync branches
+        run: |
+          git ls-remote --heads origin 'refs/heads/sync/*' | while read -r _ ref; do
+            git push origin --delete "$ref"
+          done
+
+  issues:
+    needs: [check, publish]
+    if: ${{ !cancelled() && needs.check.result == 'success' && needs.publish.result != 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Close the failure issue
         env:
           GH_TOKEN: ${{ github.token }}
-          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream-sha }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream-sha }}
         run: |
-          number=$(gh issue list --state open --search "in:title \"$FAILURE_TITLE\"" \
-            --json number,title --jq 'map(select(.title == env.FAILURE_TITLE)) | .[0].number // empty')
-          if [[ -n $number ]]; then
-            gh issue close "$number" --comment "Main contains upstream main at $UPSTREAM_SHA."
-          fi
+          gh issue list --author app/github-actions --state open --search "in:title \"$FAILURE_TITLE\"" \
+            --json number,title --jq '.[] | select(.title == env.FAILURE_TITLE) | .number' |
+            while read -r number; do
+              gh issue close "$number" --comment "Main contains upstream main at $UPSTREAM_SHA."
+            done
 
+      # Searches every state, so a retirement issue a person closed is not opened again.
       - name: Open the retirement issue
         env:
           GH_TOKEN: ${{ github.token }}
-          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream-sha }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream-sha }}
         run: |
+          git fetch --no-tags "$UPSTREAM_URL" main
           if ! git diff --quiet "$UPSTREAM_SHA" HEAD -- . ':(exclude).github'; then
             exit 0
           fi
-          number=$(gh issue list --state open --search "in:title \"$RETIRE_TITLE\"" \
-            --json number,title --jq 'map(select(.title == env.RETIRE_TITLE)) | .[0].number // empty')
-          if [[ -z $number ]]; then
+          existing=$(gh issue list --author app/github-actions --state all --search "in:title \"$RETIRE_TITLE\"" \
+            --json title --jq 'map(select(.title == env.RETIRE_TITLE)) | length')
+          if [[ $existing == 0 ]]; then
             gh issue create --title "$RETIRE_TITLE" --body "Outside .github/, main is identical to upstream main at $UPSTREAM_SHA, so every change this fork carried has landed upstream. Point consumers back at upstream and archive this fork."
           fi
 
+  report:
+    needs: [check, publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          # Kept: the sync branch push authenticates with it. Nothing upstream is executed here.
+          persist-credentials: true
+
       - name: Report the failure
-        if: failure() && steps.merge.outputs.upstream-sha != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          RESULT: ${{ steps.merge.outputs.result }}
-          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream-sha }}
+          RESULT: ${{ needs.check.outputs.result }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream-sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          branch="sync/$UPSTREAM_SHA"
-          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
-            echo "$branch already exists, so this upstream commit has already been reported."
+          if [[ -z $UPSTREAM_SHA ]]; then
+            summary="The sync failed before it read upstream main."
+          else
+            case $RESULT in
+              conflict) summary="Merging upstream main at $UPSTREAM_SHA into main conflicts." ;;
+              merged) summary="Upstream main at $UPSTREAM_SHA merged cleanly, but a check or the push to main failed." ;;
+              *) summary="The sync of upstream main at $UPSTREAM_SHA failed." ;;
+            esac
+
+            branch="sync/$UPSTREAM_SHA"
+            if git ls-remote --exit-code --heads origin "refs/heads/$branch" > /dev/null; then
+              summary="$summary $branch points at that upstream commit."
+            elif git fetch --no-tags "$UPSTREAM_URL" main && git push origin "$UPSTREAM_SHA:refs/heads/$branch"; then
+              summary="$summary $branch points at that upstream commit."
+            else
+              summary="$summary Pushing $branch failed; see the run log."
+            fi
+          fi
+
+          number=$(gh issue list --author app/github-actions --state open --search "in:title \"$FAILURE_TITLE\"" \
+            --json number,title --jq 'map(select(.title == env.FAILURE_TITLE)) | .[0].number // empty')
+          if [[ -z $number ]]; then
+            gh issue create --title "$FAILURE_TITLE" --body "$summary"$'\n\n'"Run: $RUN_URL"
             exit 0
           fi
 
-          if [[ $RESULT == conflict ]]; then
-            summary="Merging upstream main at $UPSTREAM_SHA into main conflicts. $branch points at that upstream commit."
-            ref=$UPSTREAM_SHA
-          else
-            summary="Upstream main at $UPSTREAM_SHA merged cleanly, but a check or the push to main failed. $branch holds the merge."
-            ref=HEAD
+          if [[ -n $UPSTREAM_SHA ]] && gh issue view "$number" --json body,comments \
+            --jq '[.body, .comments[].body] | any(contains(env.UPSTREAM_SHA))' | grep -qx true; then
+            echo "Issue #$number already reports $UPSTREAM_SHA."
+            exit 0
           fi
-          if ! git push origin "$ref:refs/heads/$branch"; then
-            summary="$summary Pushing $branch also failed; see the run log."
-          fi
-          body="$summary"$'\n\n'"Run: $RUN_URL"
+          gh issue comment "$number" --body "$summary"$'\n\n'"Run: $RUN_URL"
 
-          number=$(gh issue list --state open --search "in:title \"$FAILURE_TITLE\"" \
-            --json number,title --jq 'map(select(.title == env.FAILURE_TITLE)) | .[0].number // empty')
-          if [[ -n $number ]]; then
-            gh issue comment "$number" --body "$body"
-          else
-            gh issue create --title "$FAILURE_TITLE" --body "$body"
-          fi
+  # Re-enabling the workflow resets the 60-day inactivity clock that disables a public
+  # repository's schedule.
+  keepalive:
+    needs: [check, publish, issues, report]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/upstream-sync.yml/enable"
