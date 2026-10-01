@@ -1,0 +1,183 @@
+name: Sync upstream
+
+# Merges upstream main into this fork's main once a day, and pushes only when
+# the merged tree passes the checks below. Merging rather than rebasing keeps
+# every commit a consumer has pinned reachable from main.
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/quinneden/virby-nix-darwin.git
+  FAILURE_TITLE: "Sync upstream: upstream main needs a manual merge"
+  RETIRE_TITLE: "Sync upstream: the fork carries nothing beyond upstream; retire it"
+
+jobs:
+  sync:
+    # GitHub-hosted arm64, because this repository is public.
+    runs-on: macos-15
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push a merge that changes upstream's workflow files; a token
+          # with the workflows permission in SYNC_TOKEN can.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git fetch --no-tags "$UPSTREAM_URL" main
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          echo "upstream-sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Upstream main $upstream_sha is already merged."
+            echo "result=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --no-ff --no-edit -m "Merge upstream main at ${upstream_sha:0:7}" "$upstream_sha"; then
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Install Nix
+        if: steps.merge.outputs.result == 'merged'
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Evaluate the darwin module
+        if: steps.merge.outputs.result == 'merged'
+        run: |
+          nix eval --impure --raw --expr "$(
+            cat <<'EOF'
+          let
+            fork = builtins.getFlake (toString ./.);
+            nix-darwin = builtins.getFlake "github:nix-darwin/nix-darwin";
+            evalWith =
+              nestedVirtualization:
+              (nix-darwin.lib.darwinSystem {
+                modules = [
+                  fork.darwinModules.default
+                  {
+                    nixpkgs.hostPlatform = "aarch64-darwin";
+                    nixpkgs.source = fork.inputs.nixpkgs;
+                    system.stateVersion = 6;
+                    services.virby = {
+                      enable = true;
+                      inherit nestedVirtualization;
+                    };
+                  }
+                ];
+              }).config;
+            features =
+              config:
+              (builtins.head (builtins.filter (m: m.hostName == "virby-vm") config.nix.buildMachines))
+              .supportedFeatures;
+            nested = evalWith true;
+            plain = evalWith false;
+          in
+          assert builtins.elem "kvm" (features nested) && builtins.elem "nixos-test" (features nested);
+          assert !(builtins.elem "kvm" (features plain) || builtins.elem "nixos-test" (features plain));
+          ''
+            ${nested.system.build.toplevel.drvPath}
+            ${plain.system.build.toplevel.drvPath}
+          ''
+          EOF
+          )"
+
+      - name: Build vm-runner
+        if: steps.merge.outputs.result == 'merged'
+        run: nix build -L --no-link .#packages.aarch64-darwin.vm-runner
+
+      - name: Vet and test vm-runner
+        if: steps.merge.outputs.result == 'merged'
+        working-directory: pkgs/vm-runner
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          nix shell --inputs-from "$GITHUB_WORKSPACE" nixpkgs#go -c go vet ./...
+          nix shell --inputs-from "$GITHUB_WORKSPACE" nixpkgs#go -c go test ./...
+
+      - name: Push main
+        if: steps.merge.outputs.result == 'merged'
+        run: git push origin HEAD:refs/heads/main
+
+      - name: Close the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream-sha }}
+        run: |
+          number=$(gh issue list --state open --search "in:title \"$FAILURE_TITLE\"" \
+            --json number,title --jq 'map(select(.title == env.FAILURE_TITLE)) | .[0].number // empty')
+          if [[ -n $number ]]; then
+            gh issue close "$number" --comment "Main contains upstream main at $UPSTREAM_SHA."
+          fi
+
+      - name: Open the retirement issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream-sha }}
+        run: |
+          if ! git diff --quiet "$UPSTREAM_SHA" HEAD -- . ':(exclude).github'; then
+            exit 0
+          fi
+          number=$(gh issue list --state open --search "in:title \"$RETIRE_TITLE\"" \
+            --json number,title --jq 'map(select(.title == env.RETIRE_TITLE)) | .[0].number // empty')
+          if [[ -z $number ]]; then
+            gh issue create --title "$RETIRE_TITLE" --body "Outside .github/, main is identical to upstream main at $UPSTREAM_SHA, so every change this fork carried has landed upstream. Point consumers back at upstream and archive this fork."
+          fi
+
+      - name: Report the failure
+        if: failure() && steps.merge.outputs.upstream-sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.merge.outputs.result }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream-sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          branch="sync/$UPSTREAM_SHA"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
+            echo "$branch already exists, so this upstream commit has already been reported."
+            exit 0
+          fi
+
+          if [[ $RESULT == conflict ]]; then
+            summary="Merging upstream main at $UPSTREAM_SHA into main conflicts. $branch points at that upstream commit."
+            ref=$UPSTREAM_SHA
+          else
+            summary="Upstream main at $UPSTREAM_SHA merged cleanly, but a check or the push to main failed. $branch holds the merge."
+            ref=HEAD
+          fi
+          if ! git push origin "$ref:refs/heads/$branch"; then
+            summary="$summary Pushing $branch also failed; see the run log."
+          fi
+          body="$summary"$'\n\n'"Run: $RUN_URL"
+
+          number=$(gh issue list --state open --search "in:title \"$FAILURE_TITLE\"" \
+            --json number,title --jq 'map(select(.title == env.FAILURE_TITLE)) | .[0].number // empty')
+          if [[ -n $number ]]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$FAILURE_TITLE" --body "$body"
+          fi
