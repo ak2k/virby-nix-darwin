@@ -389,17 +389,20 @@ func (vp *VMProcess) startVMProcess() error {
 		fd.Close()
 	}
 
+	exitCh := make(chan struct{})
+
 	vp.mu.Lock()
 	vp.command = cmd
-	vp.processExitCh = make(chan struct{})
+	vp.processExitCh = exitCh
 	vp.mu.Unlock()
 
 	if err := vp.writePIDFile(); err != nil {
 		return err
 	}
 
+	var outputCh chan struct{}
 	if vp.config.Debug {
-		outputCh := make(chan struct{})
+		outputCh = make(chan struct{})
 
 		vp.mu.Lock()
 		vp.outputCh = outputCh
@@ -408,32 +411,20 @@ func (vp *VMProcess) startVMProcess() error {
 		go consumeVMProcessOutput(stdout, stderr, outputCh)
 	}
 
+	go vp.monitorVM(cmd, outputCh, exitCh)
+
 	return nil
 }
 
-func (vp *VMProcess) monitorVM() {
-	vp.mu.Lock()
-	cmd := vp.command
-	outputCh := vp.outputCh
-	vp.mu.Unlock()
-
-	if cmd == nil {
-		return
-	}
-
+// monitorVM is handed its own driver's command and channels: once that driver exits, IsRunning is
+// false and a new Start may replace vp's before this monitor gets to them.
+func (vp *VMProcess) monitorVM(cmd *exec.Cmd, outputCh, exitCh chan struct{}) {
 	if outputCh != nil {
 		<-outputCh
 	}
 
 	err := cmd.Wait()
-
-	vp.mu.Lock()
-	exitCh := vp.processExitCh
-	vp.mu.Unlock()
-
-	if exitCh != nil {
-		close(exitCh)
-	}
+	close(exitCh)
 
 	if err != nil && !vp.shutdownRequested.Load() {
 		slog.Error("VM process died unexpectedly", "error", err)
@@ -441,7 +432,11 @@ func (vp *VMProcess) monitorVM() {
 		slog.Info("VM shut down normally")
 	}
 
-	if !vp.shutdownRequested.Load() {
+	vp.mu.Lock()
+	current := vp.command == cmd
+	vp.mu.Unlock()
+
+	if current && !vp.shutdownRequested.Load() {
 		if vp.vmnetHelper != nil {
 			vp.vmnetHelper.Stop(10 * time.Second)
 		}
@@ -543,8 +538,6 @@ func (vp *VMProcess) Start() error {
 	if err := vp.startVMProcess(); err != nil {
 		return err
 	}
-
-	go vp.monitorVM()
 
 	sshTester := ssh.NewSSHConnectivityTester(vp.config.WorkingDirectory)
 
