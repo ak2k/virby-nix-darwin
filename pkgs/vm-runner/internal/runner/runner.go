@@ -80,6 +80,11 @@ func (r *Runner) scheduleShutdownCheck(ctx context.Context) error {
 
 	select {
 	case <-timer.C:
+		// A connection arriving during the pause would otherwise see the VM still running and
+		// proxy into it; with the lock it waits and then resumes the paused VM.
+		r.startMu.Lock()
+		defer r.startMu.Unlock()
+
 		if r.activeConnections.Load() == 0 {
 			if r.config.OnDemand {
 				if err := r.vmProcess.PauseOrStop(); err != nil {

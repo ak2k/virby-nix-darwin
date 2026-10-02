@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -100,5 +101,75 @@ func TestConcurrentConnectionsStartVMOnce(t *testing.T) {
 				t.Errorf("VM started %d times for %d concurrent connections, want 1", n, callers)
 			}
 		})
+	}
+}
+
+// pausingVM holds PauseOrStop until release is closed, so a connection can arrive while the VM pauses.
+type pausingVM struct {
+	pausing chan struct{}
+	release chan struct{}
+	running atomic.Bool
+}
+
+func (f *pausingVM) IPAddress() string    { return "" }
+func (f *pausingVM) IsRunning() bool      { return f.running.Load() }
+func (f *pausingVM) Start() error         { f.running.Store(true); return nil }
+func (f *pausingVM) Stop(_ time.Duration) { f.running.Store(false) }
+
+func (f *pausingVM) PauseOrStop() error {
+	close(f.pausing)
+	<-f.release
+	f.running.Store(false)
+	return nil
+}
+
+// Resumes a paused VM; one that has not paused yet still reports running, so this returns at once.
+func (f *pausingVM) ResumeOrStart() error {
+	f.running.Store(true)
+	return nil
+}
+
+// The idle timer of an on-demand VM fires just as the next build job connects.
+func TestConnectionDuringIdlePauseGetsRunningVM(t *testing.T) {
+	vm := &pausingVM{pausing: make(chan struct{}), release: make(chan struct{})}
+	vm.running.Store(true)
+	r := &Runner{
+		config:        &config.VMConfig{OnDemand: true},
+		signalManager: signal_manager.NewSignalManager(),
+		vmProcess:     vm,
+	}
+
+	checked := make(chan error, 1)
+	go func() { checked <- r.scheduleShutdownCheck(context.Background()) }()
+
+	select {
+	case <-vm.pausing:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown check did not pause the idle VM")
+	}
+
+	ready := make(chan error, 1)
+	go func() {
+		r.activeConnections.Add(1)
+		ready <- r.ensureVMReady()
+	}()
+
+	// Let the connection reach the VM before the pause completes.
+	time.Sleep(100 * time.Millisecond)
+	close(vm.release)
+
+	for _, ch := range []chan error{checked, ready} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("shutdown check or connection did not return")
+		}
+	}
+
+	if !vm.running.Load() {
+		t.Error("connection was handed a VM that the shutdown check then paused")
 	}
 }
