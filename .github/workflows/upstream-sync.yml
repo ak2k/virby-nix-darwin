@@ -73,10 +73,11 @@ jobs:
         with:
           github_access_token: ${{ github.token }}
 
+      # Consumers evaluate this module with import-from-derivation disallowed.
       - name: Evaluate the darwin module
         if: steps.merge.outputs.result == 'merged'
         run: |
-          nix eval --impure --raw --expr "$(
+          nix eval --impure --option allow-import-from-derivation false --raw --expr "$(
             cat <<'EOF'
           let
             fork = builtins.getFlake (toString ./.);
