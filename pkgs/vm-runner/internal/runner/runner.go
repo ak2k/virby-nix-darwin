@@ -15,6 +15,16 @@ import (
 	"vm-runner/internal/vm_process"
 )
 
+// vmController is the part of *vm_process.VMProcess the runner drives; tests substitute a fake.
+type vmController interface {
+	IPAddress() string
+	IsRunning() bool
+	PauseOrStop() error
+	ResumeOrStart() error
+	Start() error
+	Stop(timeout time.Duration)
+}
+
 type Runner struct {
 	activationSocket    net.Listener
 	activeConnections   atomic.Int32
@@ -25,7 +35,8 @@ type Runner struct {
 	shutdownTimerCancel context.CancelFunc
 	signalManager       *signal_manager.SignalManager
 	socketActivation    *socket_activation.SocketActivation
-	vmProcess           *vm_process.VMProcess
+	startMu             sync.Mutex
+	vmProcess           vmController
 }
 
 func NewRunner(config *config.VMConfig, signalManager *signal_manager.SignalManager) *Runner {
@@ -38,6 +49,11 @@ func NewRunner(config *config.VMConfig, signalManager *signal_manager.SignalMana
 }
 
 func (r *Runner) ensureVMReady() error {
+	// Each connection runs in its own goroutine. Without this, every connection that
+	// arrives while the VM is stopped or still booting starts or stops it again.
+	r.startMu.Lock()
+	defer r.startMu.Unlock()
+
 	if r.signalManager.IsShutdownRequested() {
 		return fmt.Errorf("shutdown requested, not starting VM")
 	}
