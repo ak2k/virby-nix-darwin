@@ -259,6 +259,12 @@ class VMProcess:
         if self.config.rosetta_enabled:
             cmd.extend(["--device", "rosetta,mountTag=rosetta"])
 
+        # Enable nested virtualization so the guest exposes /dev/kvm (for
+        # kvm-feature builds + NixOS VM tests). Requires an Apple M3+ host
+        # on macOS 15+ and vfkit >= 0.6.2; gated by the host config.
+        if self.config.nested_enabled:
+            cmd.append("--nested")
+
         # Add shared directories, if any
         shared_dirs = self.config.shared_dirs
         for tag, path in shared_dirs.items():

@@ -4,6 +4,16 @@
   options.services.virby = {
     enable = lib.mkEnableOption "Virby, a vfkit-based linux builder for nix-darwin";
 
+    nestedVirtualization = lib.mkEnableOption ''
+      nested virtualization for the VM, exposing /dev/kvm inside the guest.
+
+      Requires an Apple silicon host with an M3 (or newer) chip running
+      macOS 15 or later, and a vfkit that supports `--nested` (>= 0.6.2).
+      When enabled, the VM passes `--nested` to vfkit and advertises the
+      `kvm` and `nixos-test` build-machine features, so KVM-accelerated
+      builds and NixOS VM tests can run on it. Leave disabled on M1/M2
+      hosts, which cannot do nested virtualization'';
+
     allowUserSsh = lib.mkOption {
       type = lib.types.bool;
       default = false;

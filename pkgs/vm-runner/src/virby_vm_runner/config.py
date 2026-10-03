@@ -87,6 +87,12 @@ class VMConfig:
             raise VMConfigurationError(f"Invalid rosetta setting: {rosetta}. Expected: boolean")
         self._rosetta_enabled = rosetta
 
+        # Validate and store nested virtualization
+        nested = self._config.get("nested", False)
+        if not isinstance(nested, bool):
+            raise VMConfigurationError(f"Invalid nested setting: {nested}. Expected: boolean")
+        self._nested_enabled = nested
+
         # Validate and store on-demand
         on_demand = self._config.get("on-demand", False)
         if not isinstance(on_demand, bool):
@@ -172,6 +178,11 @@ class VMConfig:
     def rosetta_enabled(self) -> bool:
         """Check if Rosetta is enabled."""
         return bool(self._rosetta_enabled)
+
+    @property
+    def nested_enabled(self) -> bool:
+        """Check if nested virtualization is enabled."""
+        return bool(self._nested_enabled)
 
     @property
     def working_directory(self) -> Path:

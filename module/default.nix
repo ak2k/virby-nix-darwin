@@ -77,6 +77,7 @@ let
       cores = cfg.cores;
       debug = cfg.debug;
       memory = parseMemoryMiB cfg.memory;
+      nested = cfg.nestedVirtualization;
       on-demand = cfg.onDemand.enable;
       port = cfg.port;
       rosetta = cfg.rosetta;
@@ -224,6 +225,14 @@ let
       supportedFeatures = [
         "benchmark"
         "big-parallel"
+      ]
+      # kvm + nixos-test require a real /dev/kvm in the guest, which only
+      # exists when nested virtualization is enabled (vfkit --nested, on
+      # Apple M3+ / macOS 15+). Advertising them unconditionally makes nix
+      # route kvm drvs to this VM where they fail with "failed to
+      # initialize kvm"; gate them on the option so they route to a real
+      # kvm builder otherwise.
+      ++ lib.optionals cfg.nestedVirtualization [
         "kvm"
         "nixos-test"
       ];
