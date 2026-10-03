@@ -93,6 +93,7 @@ let
     cd ${workingDirectory}
 
     NEEDS_GENERATE_SSH_KEYS=0
+    SSH_KEYS_REGENERATED=0
 
     should_generate_ssh_keys() {
       local key_files=(
@@ -177,6 +178,7 @@ let
         ${logError} "Failed to generate SSH keys"
         exit 1
       fi
+      SSH_KEYS_REGENERATED=1
     fi
 
     # The runner always uses the private key directly, so it must stay owner-only.
@@ -214,6 +216,19 @@ let
     if ! chmod 'go+r' ${sshKnownHostsFileName}; then
       ${logError} "Failed to set permissions on ${sshKnownHostsFileName}"
       exit 1
+    fi
+
+    # If the SSH host key was just regenerated and the daemon is already
+    # loaded, the currently-running VM (if any) is still serving the
+    # previous host key. Kick the daemon so the next builder connection
+    # on the proxied port starts a fresh VM with the new key. Without
+    # this, dispatched Linux builds fail with "REMOTE HOST IDENTIFICATION
+    # HAS CHANGED" until someone manually restarts the daemon.
+    # See: https://github.com/quinneden/virby-nix-darwin/issues/22
+    if [[ $SSH_KEYS_REGENERATED -eq 1 ]] && \
+       /bin/launchctl print system/org.nixos.${daemonName} >/dev/null 2>&1; then
+      ${logInfo} "Restarting ${daemonName} to apply regenerated SSH host key..."
+      /bin/launchctl kickstart -k system/org.nixos.${daemonName} || true
     fi
   '';
 
